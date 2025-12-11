@@ -50,7 +50,7 @@ python3 asteroids.py single
 
 ### Multiplayer Mode
 
-The game supports multiplayer via network sockets. One player hosts the server, and another connects as a client.
+The game supports multiplayer via network UDP datagrams. One player hosts the server, and another connects as a client.
 
 #### Option 1: Same PC (Local Network)
 
