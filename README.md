@@ -115,47 +115,6 @@ Or use the menu:
 - **Protocol**: TCP
 - **Connection**: One server, one client (2 players total)
 
-### Troubleshooting
-
-**Connection Refused:**
-- Make sure the server is running before the client tries to connect
-- Check that both PCs are on the same network
-- Verify the server IP address is correct
-- Ensure firewall allows port 5555
-
-**Can't See Other Player:**
-- Wait a moment for the connection to establish
-- Check that both players are in multiplayer mode
-- Restart both server and client if issues persist
-
-**High Latency:**
-- Ensure both PCs are on a stable network connection
-- Close other bandwidth-intensive applications
-- For best results, use a wired connection instead of WiFi
-
-## Game Modes
-
-### Single Player
-- Classic asteroid shooter
-- Compete for high scores
-- High score is saved locally
-
-### Multiplayer
-- Two players share the same game world
-- Server player (P1) spawns on the left
-- Client player (P2) spawns on the right
-- Both players can see each other's bullets and movements
-- Shared asteroid field
-- Independent scores and lives
-
-## Technical Details
-
-- High scores are stored in `max_score.bin` (binary format)
-- Game runs at 60 FPS
-- Network updates every frame for smooth gameplay
-- Server is authoritative for asteroids
-- Both players send their positions and bullets
-
 ## License
 
-Free to use and edit. Have fun!
+Rafa says: Free to use and edit. Have fun!
