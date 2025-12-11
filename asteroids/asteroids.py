@@ -65,7 +65,6 @@ is_server = False
 is_client = False
 server_socket = None
 client_socket = None
-client_conn = None
 network_thread = None
 PORT = 5555
 HOST = 'localhost'
@@ -74,12 +73,16 @@ player_id = 0  # 0 for server player, 1 for client player
 remote_player = None
 remote_bullets = []  # Changed to list for multiple bullets
 remote_score = 0
-remote_life = 5
+remote_life = 1  # Fixed: consistent with life = 1
 network_frame_counter = 0
 NETWORK_UPDATE_INTERVAL = 1  # Update every frame for smoothness
 prev_life = 1  # Track previous life for death sound
+prev_remote_life = 1  # Track remote player life for death sound
 shoot_cooldown = 0  # Cooldown for shooting (frames)
 SHOOT_COOLDOWN_TIME = 1  # Frames between shots (allows very rapid fire)
+sequence_number = 0  # Sequence number for outgoing messages
+last_received_seq = -1  # Last received sequence number (discard older packets)
+client_addr = None  # Client address for UDP (server only)
 
 # ----display-----:
 w, h = 650, 650
@@ -122,7 +125,7 @@ def blit_rotate_center(s, img, top_l, angle, blit=True):
     return new_rect.center
 
 def reset_game():
-    global player1, bullets, asteroids, score, life, game_o, remote_player, remote_bullets, remote_score, remote_life, prev_life
+    global player1, bullets, asteroids, score, life, game_o, remote_player, remote_bullets, remote_score, remote_life, prev_life, sequence_number, last_received_seq
     if is_multiplayer:
         if player_id == 0:
             player1 = shooter(w//4, h//2)
@@ -146,46 +149,62 @@ def reset_game():
         remote_bullets = []  # Reset remote bullets list
         remote_score = 0
         remote_life = 1
+        prev_remote_life = 1
     prev_life = life
+    sequence_number = 0
+    last_received_seq = -1
 
 def start_server():
-    global server_socket, client_conn, connected, is_server, is_multiplayer
+    global server_socket, connected, is_server, is_multiplayer, client_addr, sequence_number, last_received_seq
     is_server = True
     is_multiplayer = True
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sequence_number = 0
+    last_received_seq = -1
+    client_addr = None
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     # Bind to all interfaces (0.0.0.0) to accept connections from other PCs
     server_socket.bind(('0.0.0.0', PORT))
-    server_socket.listen(1)
-    print(f"Server started on port {PORT}. Waiting for client...")
+    server_socket.setblocking(False)
+    print(f"Server started on port {PORT} (UDP). Waiting for client...")
     print(f"Connect using your local IP address (e.g., 192.168.x.x)")
-    client_conn, addr = server_socket.accept()
-    client_conn.setblocking(False)
-    client_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    connected = True
-    print(f"Client connected from {addr}")
-    return True
+    # Wait for first packet from client to establish connection
+    import time
+    start_time = time.time()
+    while time.time() - start_time < 30:  # Wait up to 30 seconds
+        try:
+            data, addr = server_socket.recvfrom(4096)
+            client_addr = addr
+            connected = True
+            print(f"Client connected from {addr}")
+            return True
+        except BlockingIOError:
+            time.sleep(0.1)
+    print("Timeout waiting for client")
+    return False
 
 def start_client(host='localhost'):
-    global client_socket, connected, is_client, is_multiplayer, HOST
+    global client_socket, connected, is_client, is_multiplayer, HOST, sequence_number, last_received_seq
     is_client = True
     is_multiplayer = True
     HOST = host
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sequence_number = 0
+    last_received_seq = -1
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP
+    client_socket.setblocking(False)
+    # Send initial packet to establish connection
     try:
-        client_socket.connect((HOST, PORT))
-        client_socket.setblocking(False)
+        # Send empty packet to establish connection
+        client_socket.sendto(b'connect', (HOST, PORT))
         connected = True
-        print(f"Connected to server at {HOST}:{PORT}")
+        print(f"Connected to server at {HOST}:{PORT} (UDP)")
         return True
     except Exception as e:
         print(f"Failed to connect: {e}")
         return False
 
 def send_game_state():
-    global player1, bullets, asteroids, score, life
+    global player1, bullets, asteroids, score, life, sequence_number
     if not connected:
         return
     
@@ -193,6 +212,7 @@ def send_game_state():
         # Send only active bullets (not off screen)
         active_bullets = [b.to_dict() for b in bullets if not b.d_off_screen()]
         state = {
+            'seq': sequence_number,
             'player': player1.to_dict(),
             'bullets': active_bullets,
             'asteroids': [a.to_dict() for a in asteroids] if is_server else None,
@@ -200,76 +220,93 @@ def send_game_state():
             'life': life
         }
         data = pickle.dumps(state)
-        if is_server and client_conn:
-            client_conn.sendall(len(data).to_bytes(4, 'big') + data)
+        sequence_number += 1
+        
+        if is_server and client_addr:
+            server_socket.sendto(data, client_addr)
         elif is_client and client_socket:
-            client_socket.sendall(len(data).to_bytes(4, 'big') + data)
+            client_socket.sendto(data, (HOST, PORT))
     except (ConnectionError, OSError):
         pass  # Connection lost
     except Exception:
         pass  # Other errors
 
 def receive_game_state():
-    global remote_player, remote_bullets, asteroids, remote_score, remote_life, connected, on
+    global remote_player, remote_bullets, asteroids, remote_score, remote_life, connected, on, last_received_seq, client_addr
     if not connected:
         return False
     
     try:
-        if is_server and client_conn:
-            sock = client_conn
+        if is_server and server_socket:
+            sock = server_socket
         elif is_client and client_socket:
             sock = client_socket
         else:
             return False
         
-        # Try to receive data (non-blocking)
-        try:
-            # Read length (non-blocking, returns immediately)
-            length_bytes = sock.recv(4)
-            if len(length_bytes) < 4:
-                return False
-            length = int.from_bytes(length_bytes, 'big')
-            
-            # Read message data (non-blocking)
-            data = sock.recv(length)
-            if len(data) < length:
-                return False  # Partial message, try again next frame
-            
-            state = pickle.loads(data)
-            
-            if remote_player:
-                remote_player.from_dict(state['player'])
-            
-            # Update remote bullets list
-            remote_bullet_data = state.get('bullets', [])
-            prev_remote_count = len(remote_bullets)
-            
-            # Create or update remote bullets
-            remote_bullets = []
-            for bullet_data in remote_bullet_data:
-                bullet = Bullet()
-                bullet.from_dict(bullet_data)
-                remote_bullets.append(bullet)
-            
-            # Play sound when new bullets appear
-            if pew_sound and len(remote_bullets) > prev_remote_count:
-                pew_sound.play()
-            
-            # Server syncs asteroids to client
-            if is_client and 'asteroids' in state:
-                if len(asteroids) != len(state['asteroids']):
-                    asteroids = [Asteroid() for _ in range(len(state['asteroids']))]
-                for i, ast_data in enumerate(state['asteroids']):
-                    asteroids[i].from_dict(ast_data)
-            
-            remote_score = state.get('score', 0)
-            remote_life = state.get('life', 1)
-            return True
-        except BlockingIOError:
-            return False
+        # Try to receive UDP datagrams (non-blocking)
+        # Process multiple datagrams if available (up to 10 per frame to avoid lag)
+        processed = False
+        for _ in range(10):  # Process up to 10 packets per frame
+            try:
+                data, addr = sock.recvfrom(4096)
+                
+                # Update client address if server (in case it changed)
+                if is_server:
+                    client_addr = addr
+                
+                # Ignore connection packets
+                if data == b'connect':
+                    continue
+                
+                # Deserialize state
+                state = pickle.loads(data)
+                
+                # Check sequence number - discard old packets
+                seq = state.get('seq', -1)
+                if seq <= last_received_seq:
+                    continue  # Old packet, discard
+                
+                last_received_seq = seq
+                processed = True
+                
+                if remote_player:
+                    remote_player.from_dict(state['player'])
+                
+                # Update remote bullets list
+                remote_bullet_data = state.get('bullets', [])
+                prev_remote_count = len(remote_bullets)
+                
+                # Create or update remote bullets
+                remote_bullets = []
+                for bullet_data in remote_bullet_data:
+                    bullet = Bullet()
+                    bullet.from_dict(bullet_data)
+                    remote_bullets.append(bullet)
+                
+                # Play sound when new bullets appear
+                if pew_sound and len(remote_bullets) > prev_remote_count:
+                    pew_sound.play()
+                
+                # Server syncs asteroids to client
+                if is_client and 'asteroids' in state and state['asteroids']:
+                    if len(asteroids) != len(state['asteroids']):
+                        asteroids = [Asteroid() for _ in range(len(state['asteroids']))]
+                    for i, ast_data in enumerate(state['asteroids']):
+                        asteroids[i].from_dict(ast_data)
+                
+                remote_score = state.get('score', 0)
+                remote_life = state.get('life', 1)
+            except BlockingIOError:
+                # No more packets available
+                break
+            except Exception:
+                # Skip malformed packets
+                continue
+        
+        return processed
     except (ConnectionError, OSError):
-        connected = False
-        on = False  # Disconnect
+        # Connection lost - but UDP is connectionless, so just continue
         return False
     except Exception:
         return False
@@ -467,9 +504,10 @@ class Asteroid:
             random.seed(seed)
         self.size = random.uniform(0.1, 0.5)
         self.x, self.y, self.x_speed, self.y_speed = random.randint(0, w), random.randint(0, h), random.uniform(-asteroid_speed, asteroid_speed), random.uniform(-asteroid_speed, asteroid_speed)
-        self.image = pygame.transform.scale_by(random.choice(asteroids_imgs), self.size)
-        self.hitbox = pygame.Rect(self.x, self.y, round(self.image.get_width()), round(self.image.get_height()))
+        # Generate img_index first, then use it to select the image (consistent with spawn() and from_dict())
         self.img_index = random.randint(0, len(asteroids_imgs) - 1)
+        self.image = pygame.transform.scale_by(asteroids_imgs[self.img_index], self.size)
+        self.hitbox = pygame.Rect(self.x, self.y, round(self.image.get_width()), round(self.image.get_height()))
     
     def to_dict(self):
         return {
@@ -634,6 +672,9 @@ while on:
             # Remote player collision (server only)
             if is_server and remote_player and asteroid.hitbox.colliderect(remote_player.hitbox):
                 remote_life -= 1
+                # Play death sound when remote player life decreases
+                if ah_sound and remote_life < prev_remote_life:
+                    ah_sound.play()
                 asteroid.spawn()
             
             asteroid.draw()
@@ -717,6 +758,7 @@ while on:
         
         # Update previous states for sound detection
         prev_life = life
+        prev_remote_life = remote_life
 
         pygame.display.flip()
         clock.tick(60)  # 60 FPS
@@ -732,8 +774,6 @@ with open(arquivo, "wb") as f:
 # Cleanup network connections
 if is_server and server_socket:
     try:
-        if client_conn:
-            client_conn.close()
         server_socket.close()
     except:
         pass
